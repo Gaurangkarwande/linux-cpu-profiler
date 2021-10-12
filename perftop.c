@@ -9,6 +9,7 @@
 #include <linux/kallsyms.h>
 #include <linux/spinlock.h>
 #include <linux/jhash.h>
+#include <linux/ktime.h>
 
 
 #include <linux/proc_fs.h>
@@ -51,11 +52,12 @@ struct trace_hash_entry { 		//trace_hash_table node
 	unsigned int pid;
 	unsigned long stack_log[MAX_TRACE_SIZE];
 	unsigned int stack_log_length;
+	u64 task_duration;
 	struct hlist_node node;
 };
 
 
-static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long* stack_log, unsigned int stack_lenght)
+static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long* stack_log, unsigned int stack_lenght, u64 task_duration)
 {
 	int i;
 	struct trace_hash_entry *new_entry;
@@ -75,6 +77,7 @@ static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned l
 	new_entry->pid = pid;
 	new_entry->stack_log_length = stack_lenght;
 	new_entry->freq = 1;
+	new_entry->task_duration = task_duration;
 	for (i = 0; i < stack_lenght && stack_lenght <= MAX_TRACE_SIZE; i++)
 	{
 		new_entry->stack_log[i] = stack_log[i];
@@ -89,7 +92,7 @@ static void trace_hash_print_table(struct seq_file *m)
 	int bkt, i; 
 	hash_for_each(trace_hash_table, bkt, current_entry, node) 
 	{
-		seq_printf(m, "PID : %u \t Frequency : %u \n", current_entry->pid, current_entry->freq);
+		seq_printf(m, "PID : %u \t Frequency : %u \t CPU Cycles: %lld  \n", current_entry->pid, current_entry->freq, current_entry->task_duration);
 		seq_printf(m, "Stack Trace : \n");
 		if (current_entry->stack_log_length == 0)
 		{
@@ -119,20 +122,30 @@ static void destroy_hash_table_and_free(void)
 }
 */
 
+static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	u64* entry_time = (u64*)ri->data; // what is this, how it works
+	*entry_time = rdtsc();
+	return 0;
+}
+
 int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 	int err;
 	unsigned long flags;
 	unsigned int pid, stack_log_length;
 	u32 stack_trace_hash_key;
+	u64 task_duration;
+	u64* entry_time = (u64*) ri->data;
 	unsigned long current_task_struct_pointer = regs->ax;
 	struct task_struct* curr_task = (struct task_struct*)current_task_struct_pointer;
+	task_duration = rdtsc() - *entry_time;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
 	if (curr_task != NULL)
 	{
 		pid = (unsigned int)curr_task->pid;
 		if (curr_task->mm == NULL)
 		{
-			stack_log_length = stack_trace_save(&(*stack_trace_log), MAX_TRACE_SIZE, 6); //stack_trace_log[0] vs stack_trace_log vs *stack_trace_log
+			stack_log_length = stack_trace_save(&(*stack_trace_log), MAX_TRACE_SIZE, 6); //stack_trace_log[0] vs stack_trace_log vs *stack_trace_log. why 6
 		}
 		else
 		{
@@ -140,7 +153,7 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 		}
 		stack_trace_hash_key = jhash2((u32*)stack_trace_log,stack_log_length*2,0);
 
-		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length);
+		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
 		if (err)
 		{
 			printk(KERN_INFO "Error in ret_handler \n");
@@ -151,16 +164,9 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 	return 0;
 }
 
-/*
-void post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags){
-	
-}
-*/
 
 static int  proj3 (struct seq_file *m, void *v)
 {
-	//seq_printf(m, "Hello World \n");
-	//seq_printf(m, "Counter: %d \n", counter);
 	unsigned long flags;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
 	trace_hash_print_table(m);
@@ -203,6 +209,7 @@ static int __init perftop_init(void)
 		return -1;
 	}
 	kallsyms_stack_trace_save_user = (void*)kallsyms_lookup_name("stack_trace_save_user");
+	my_kretprobe.entry_handler = entry_handler;
 	my_kretprobe.handler = ret_handler;
 	my_kretprobe.kp.symbol_name = probed_function_name;
 	ret = register_kretprobe(&my_kretprobe);
