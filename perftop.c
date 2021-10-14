@@ -26,7 +26,7 @@ MODULE_DESCRIPTION("LKP Project 3");
 #define MAX_TRACE_SIZE 51
 #define NUM_TASKS 20
 
-u64 initial_time;
+u64 prev_task_exit_time;
 
 extern unsigned int stack_trace_save_user(unsigned long *store, unsigned int size);
 #define stack_trace_save_user (*(typeof(&stack_trace_save_user)) kallsyms_stack_trace_save_user)
@@ -58,7 +58,7 @@ struct trace_hash_entry { 		//trace_hash_table node
 };
 
 
-static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long* stack_log, unsigned int stack_lenght, u64 exit_time)
+static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long* stack_log, unsigned int stack_lenght, u64 task_duration)
 {
 	int i;
 	struct trace_hash_entry *new_entry;
@@ -78,13 +78,12 @@ static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned l
 	new_entry->pid = pid;
 	new_entry->stack_log_length = stack_lenght;
 	new_entry->freq = 1;
-	new_entry->task_duration = exit_time - initial_time;
+	new_entry->task_duration = task_duration;
 	for (i = 0; i < stack_lenght && stack_lenght <= MAX_TRACE_SIZE; i++)
 	{
 		new_entry->stack_log[i] = stack_log[i];
 	}
 	hash_add(trace_hash_table, &new_entry->node, key);
-	initial_time = exit_time;
 	return 0;
 }
 
@@ -136,12 +135,14 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 	unsigned long flags;
 	unsigned int pid, stack_log_length;
 	u32 stack_trace_hash_key;
-	u64 exit_time = rdtsc();
+	u64 current_task_exit_time, task_duration;
 	//u64* entry_time = (u64*) ri->data;
 	unsigned long current_task_struct_pointer = regs->ax;
 	struct task_struct* curr_task = (struct task_struct*)current_task_struct_pointer;
 	//task_duration = rdtsc() - *entry_time;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
+	current_task_exit_time = rdtsc();
+	task_duration = current_task_exit_time - prev_task_exit_time;
 	if (curr_task != NULL)
 	{
 		pid = (unsigned int)curr_task->pid;
@@ -155,13 +156,14 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 		}
 		stack_trace_hash_key = jhash2((u32*)stack_trace_log,stack_log_length*2,0);
 
-		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, exit_time);
+		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
 		if (err)
 		{
 			printk(KERN_INFO "Error in ret_handler \n");
 			return err;
 		}
 	}
+	prev_task_exit_time = current_task_exit_time;
 	spin_unlock_irqrestore(&trace_hash_table_lock, flags);
 	return 0;
 }
@@ -198,19 +200,20 @@ static int get_access_to_kallsyms(void)
 	}
 	my_kallsyms_lookup_name = kp_lookup.addr;
 	unregister_kprobe(&kp_lookup);
-	pr_alert("kallsyms_llokup_name found at 0x%px \n", my_kallsyms_lookup_name);
 	return 0;
 }
 
 static int __init perftop_init(void)
 {
+	
 	int ret;
 	int lookup_ret = get_access_to_kallsyms();
 	if (lookup_ret < 0) {
 		printk(KERN_INFO "Getting access to kallsyms failed\n");
 		return -1;
 	}
-	initial_time = rdtsc();
+	prev_task_exit_time = rdtsc();
+	pr_alert("We are in perftop init \n");
 	kallsyms_stack_trace_save_user = (void*)kallsyms_lookup_name("stack_trace_save_user");
 	my_kretprobe.entry_handler = entry_handler;
 	my_kretprobe.handler = ret_handler;
