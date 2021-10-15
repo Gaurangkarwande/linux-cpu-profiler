@@ -25,7 +25,6 @@ MODULE_DESCRIPTION("LKP Project 3");
 #define MAX_TRACE_SIZE 51
 #define NUM_TASKS 20
 
-u64 prev_task_exit_time;
 
 extern unsigned int stack_trace_save_user(unsigned long *store, unsigned int size);
 #define stack_trace_save_user (*(typeof(&stack_trace_save_user))kallsyms_stack_trace_save_user)
@@ -94,8 +93,8 @@ static int trace_rbtree_store_value(unsigned int key, unsigned int pid, unsigned
 	u64 prev_task_duration = 0;
 	unsigned prev_freq = 0;
 	struct trace_rbtree_entry *new_entry, *current_entry;
+	struct rb_node **link = &trace_rbtree.rb_node, *parent;
 	delete_prev_rbtree_entry(key, &prev_task_duration, &prev_freq);
-	struct rb_node **link = &trace_rbtree.rb_node, *parent; // ->
 	if ((new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC)) == NULL)
 	{
 		return -ENOMEM;
@@ -140,7 +139,7 @@ static void trace_rbtree_print_value(struct seq_file *m, int max_count)
 		}
 		for (j = 0; j < current_entry->stack_log_length; j++)
 		{
-			seq_printf(m, "%p\n", (void *)current_entry->stack_log[i]);
+			seq_printf(m, "%p\n", (void *)current_entry->stack_log[j]);
 		}
 		i++;
 		seq_printf(m, "\n");
@@ -215,25 +214,16 @@ static void destroy_hash_table_and_free(void)
 
 static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	//u64* entry_time = (u64*)ri->data;
-	//*entry_time = rdtsc();
-	return 0;
-}
-
-int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
 	int err;
 	unsigned long flags;
 	unsigned int pid, stack_log_length;
 	u32 stack_trace_hash_key;
-	u64 current_task_exit_time, task_duration;
-	//u64* entry_time = (u64*) ri->data;
-	//task_duration = rdtsc() - *entry_time;
-	unsigned long current_task_struct_pointer = regs->ax;
+	u64 task_duration;
+	unsigned long current_task_struct_pointer = regs->si;
 	struct task_struct *curr_task = (struct task_struct *)current_task_struct_pointer;
+	u64* entry_time = (u64*) ri->data;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
-	current_task_exit_time = rdtsc();
-	task_duration = current_task_exit_time - prev_task_exit_time;
+	task_duration = rdtsc() - *entry_time;
 	if (curr_task != NULL)
 	{
 		pid = (unsigned int)curr_task->pid;
@@ -255,7 +245,16 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 			return err;
 		}
 	}
-	prev_task_exit_time = current_task_exit_time;
+	spin_unlock_irqrestore(&trace_hash_table_lock, flags);
+	return 0;
+}
+
+int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	unsigned long flags;
+	u64* entry_time = (u64*)ri->data;
+	spin_lock_irqsave(&trace_hash_table_lock, flags);
+	*entry_time = rdtsc();
 	spin_unlock_irqrestore(&trace_hash_table_lock, flags);
 	return 0;
 }
@@ -306,7 +305,6 @@ static int __init perftop_init(void)
 		printk(KERN_INFO "Getting access to kallsyms failed\n");
 		return -1;
 	}
-	prev_task_exit_time = rdtsc();
 	pr_alert("We are in perftop init \n");
 	kallsyms_stack_trace_save_user = (void *)kallsyms_lookup_name("stack_trace_save_user");
 	my_kretprobe.entry_handler = entry_handler;
