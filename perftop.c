@@ -10,12 +10,11 @@
 #include <linux/spinlock.h>
 #include <linux/jhash.h>
 #include <linux/ktime.h>
-
+#include <linux/rbtree.h>
 
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <asm/uaccess.h>
-
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("[Gaurang Karwande]");
@@ -29,26 +28,26 @@ MODULE_DESCRIPTION("LKP Project 3");
 u64 prev_task_exit_time;
 
 extern unsigned int stack_trace_save_user(unsigned long *store, unsigned int size);
-#define stack_trace_save_user (*(typeof(&stack_trace_save_user)) kallsyms_stack_trace_save_user)
+#define stack_trace_save_user (*(typeof(&stack_trace_save_user))kallsyms_stack_trace_save_user)
 void *kallsyms_stack_trace_save_user = NULL;
 
-
 extern unsigned long kallsyms_lookup_name(const char *name);
-#define kallsyms_lookup_name (*(typeof((&kallsyms_lookup_name))) my_kallsyms_lookup_name)
+#define kallsyms_lookup_name (*(typeof((&kallsyms_lookup_name)))my_kallsyms_lookup_name)
 void *my_kallsyms_lookup_name = NULL;
 
 static struct kretprobe my_kretprobe;
 static struct kprobe kp_lookup = {
-    .symbol_name = "kallsyms_lookup_name"
-};
+	.symbol_name = "kallsyms_lookup_name"};
 
 unsigned long stack_trace_log[MAX_TRACE_SIZE];
 static char probed_function_name[FUNCTION_NAME_LENGTH] = "pick_next_task_fair";
 
 static DEFINE_HASHTABLE(trace_hash_table, TBL_SIZE);
+static struct rb_root trace_rbtree = RB_ROOT;
 static DEFINE_SPINLOCK(trace_hash_table_lock);
 
-struct trace_hash_entry { 		//trace_hash_table node
+struct trace_hash_entry
+{ //trace_hash_table node
 	unsigned int freq;
 	unsigned int pid;
 	unsigned long stack_log[MAX_TRACE_SIZE];
@@ -57,20 +56,111 @@ struct trace_hash_entry { 		//trace_hash_table node
 	struct hlist_node node;
 };
 
+struct trace_rbtree_entry
+{
+	unsigned int key;
+	unsigned int freq;
+	unsigned int pid;
+	unsigned long stack_log[MAX_TRACE_SIZE];
+	unsigned int stack_log_length;
+	u64 task_duration;
+	struct rb_node node;
+};
 
-static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long* stack_log, unsigned int stack_lenght, u64 task_duration)
+static bool delete_prev_rbtree_entry(unsigned int key, u64 *task_duration, unsigned int *freq)
+{
+	struct rb_node *node;
+	struct trace_rbtree_entry *current_entry;
+	for (node = rb_first(&trace_rbtree); node; node = rb_next(node))
+	{
+		current_entry = rb_entry(node, struct trace_rbtree_entry, node);
+		if (current_entry->key == key)
+		{
+			*task_duration = current_entry->task_duration;
+			*freq = current_entry->freq;
+			rb_erase(&current_entry->node, &trace_rbtree);
+			kfree(current_entry);
+			return true;
+		}
+	}
+	*task_duration = 0;
+	*freq = 0;
+	return false;
+}
+
+static int trace_rbtree_store_value(unsigned int key, unsigned int pid, unsigned long *stack_log, unsigned int stack_lenght, u64 task_duration)
+{
+	int i = 0;
+	u64 prev_task_duration = 0;
+	unsigned prev_freq = 0;
+	struct trace_rbtree_entry *new_entry, *current_entry;
+	delete_prev_rbtree_entry(key, &prev_task_duration, &prev_freq);
+	struct rb_node **link = &trace_rbtree.rb_node, *parent; // ->
+	if ((new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC)) == NULL)
+	{
+		return -ENOMEM;
+	}
+	new_entry->key = key;
+	new_entry->pid = pid;
+	new_entry->stack_log_length = stack_lenght;
+	new_entry->freq = prev_freq + 1;
+	new_entry->task_duration = prev_task_duration + task_duration;
+	for (i = 0; i < stack_lenght && stack_lenght <= MAX_TRACE_SIZE; i++)
+	{
+		new_entry->stack_log[i] = stack_log[i];
+	}
+	while (*link)
+	{
+		parent = *link;
+		current_entry = rb_entry(parent, struct trace_rbtree_entry, node);
+		if (current_entry->task_duration > new_entry->task_duration)
+			link = &(*link)->rb_left;
+		else
+			link = &(*link)->rb_right;
+	}
+	rb_link_node(&new_entry->node, parent, link);
+	rb_insert_color(&new_entry->node, &trace_rbtree);
+	return 0;
+}
+
+static void trace_rbtree_print_value(struct seq_file *m, int max_count)
+{
+	int i = 0, j;
+	struct rb_node *node;
+	struct trace_rbtree_entry *current_entry;
+	for (node = rb_first(&trace_rbtree); node && i <= max_count; node = rb_next(node))
+	{
+		seq_printf(m, "Node : %d \n", i);
+		current_entry = rb_entry(node, struct trace_rbtree_entry, node);
+		seq_printf(m, "PID : %u \t Frequency : %u \t CPU Cycles: %lld  \n", current_entry->pid, current_entry->freq, current_entry->task_duration);
+		seq_printf(m, "Stack Trace : \n");
+		if (current_entry->stack_log_length == 0)
+		{
+			seq_printf(m, "No Stack Trace.\n");
+		}
+		for (j = 0; j < current_entry->stack_log_length; j++)
+		{
+			seq_printf(m, "%p\n", (void *)current_entry->stack_log[i]);
+		}
+		i++;
+		seq_printf(m, "\n");
+	}
+}
+
+static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long *stack_log, unsigned int stack_lenght, u64 task_duration)
 {
 	int i;
 	struct trace_hash_entry *new_entry;
 	hash_for_each_possible(trace_hash_table, new_entry, node, key)
 	{
-		if (new_entry != NULL) 
+		if (new_entry != NULL)
 		{
 			new_entry->freq += 1;
+			new_entry->task_duration += task_duration;
 			return 0;
 		}
 	}
-	if ((new_entry = kmalloc(sizeof( *new_entry), GFP_ATOMIC)) == NULL) 
+	if ((new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC)) == NULL)
 	{
 		printk(KERN_INFO "No memory to add new hash table entry \n");
 		return -ENOMEM;
@@ -87,21 +177,21 @@ static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned l
 	return 0;
 }
 
-static void trace_hash_print_table(struct seq_file *m) 
+static void trace_hash_print_table(struct seq_file *m)
 {
 	struct trace_hash_entry *current_entry;
-	int bkt, i; 
-	hash_for_each(trace_hash_table, bkt, current_entry, node) 
+	int bkt, i;
+	hash_for_each(trace_hash_table, bkt, current_entry, node)
 	{
 		seq_printf(m, "PID : %u \t Frequency : %u \t CPU Cycles: %lld  \n", current_entry->pid, current_entry->freq, current_entry->task_duration);
 		seq_printf(m, "Stack Trace : \n");
 		if (current_entry->stack_log_length == 0)
 		{
-			seq_printf(m,"No Stack Trace.\n");
+			seq_printf(m, "No Stack Trace.\n");
 		}
 		for (i = 0; i < current_entry->stack_log_length; i++)
 		{
-			seq_printf(m,"%p\n",(void*)current_entry->stack_log[i]);
+			seq_printf(m, "%p\n", (void *)current_entry->stack_log[i]);
 		}
 	}
 	seq_printf(m, "\n");
@@ -130,16 +220,17 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
+int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
 	int err;
 	unsigned long flags;
 	unsigned int pid, stack_log_length;
 	u32 stack_trace_hash_key;
 	u64 current_task_exit_time, task_duration;
 	//u64* entry_time = (u64*) ri->data;
-	unsigned long current_task_struct_pointer = regs->ax;
-	struct task_struct* curr_task = (struct task_struct*)current_task_struct_pointer;
 	//task_duration = rdtsc() - *entry_time;
+	unsigned long current_task_struct_pointer = regs->ax;
+	struct task_struct *curr_task = (struct task_struct *)current_task_struct_pointer;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
 	current_task_exit_time = rdtsc();
 	task_duration = current_task_exit_time - prev_task_exit_time;
@@ -154,9 +245,10 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 		{
 			stack_log_length = stack_trace_save_user(&(*stack_trace_log), MAX_TRACE_SIZE);
 		}
-		stack_trace_hash_key = jhash2((u32*)stack_trace_log,stack_log_length*2,0);
+		stack_trace_hash_key = jhash2((u32 *)stack_trace_log, stack_log_length * 2, 0);
 
 		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
+		err = trace_rbtree_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
 		if (err)
 		{
 			printk(KERN_INFO "Error in ret_handler \n");
@@ -168,17 +260,17 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs){
 	return 0;
 }
 
-
-static int  proj3 (struct seq_file *m, void *v)
+static int proj3(struct seq_file *m, void *v)
 {
 	unsigned long flags;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
-	trace_hash_print_table(m);
+	//trace_hash_print_table(m);
+	trace_rbtree_print_value(m, 20);
 	spin_unlock_irqrestore(&trace_hash_table_lock, flags);
 	return 0;
 }
 
-static int  perftop_open(struct inode *inode, struct file *file)
+static int perftop_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, proj3, NULL);
 }
@@ -194,7 +286,8 @@ static int get_access_to_kallsyms(void)
 {
 	int lookup_ret;
 	lookup_ret = register_kprobe(&kp_lookup);
-	if (lookup_ret < 0) {
+	if (lookup_ret < 0)
+	{
 		printk(KERN_INFO "probing kallsyms_lookup_name failed, returned %d\n", lookup_ret);
 		return -1;
 	}
@@ -205,21 +298,23 @@ static int get_access_to_kallsyms(void)
 
 static int __init perftop_init(void)
 {
-	
+
 	int ret;
 	int lookup_ret = get_access_to_kallsyms();
-	if (lookup_ret < 0) {
+	if (lookup_ret < 0)
+	{
 		printk(KERN_INFO "Getting access to kallsyms failed\n");
 		return -1;
 	}
 	prev_task_exit_time = rdtsc();
 	pr_alert("We are in perftop init \n");
-	kallsyms_stack_trace_save_user = (void*)kallsyms_lookup_name("stack_trace_save_user");
+	kallsyms_stack_trace_save_user = (void *)kallsyms_lookup_name("stack_trace_save_user");
 	my_kretprobe.entry_handler = entry_handler;
 	my_kretprobe.handler = ret_handler;
 	my_kretprobe.kp.symbol_name = probed_function_name;
 	ret = register_kretprobe(&my_kretprobe);
-	if (ret < 0) {
+	if (ret < 0)
+	{
 		printk(KERN_INFO "register_kretprobe failed, returned %d\n", ret);
 		return -1;
 	}
@@ -228,7 +323,6 @@ static int __init perftop_init(void)
 	proc_create("perftop", 0, NULL, &perftop_ops);
 	return 0;
 }
-
 
 static void __exit perftop_exit(void)
 {
