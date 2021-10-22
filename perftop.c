@@ -119,7 +119,7 @@ static int trace_rbtree_store_value(unsigned int key, unsigned int pid, unsigned
 	{
 		parent = *link;
 		current_entry = rb_entry(parent, struct trace_rbtree_entry, node);
-		if (current_entry->task_duration > new_entry->task_duration)
+		if (current_entry->task_duration < new_entry->task_duration)
 			link = &(*link)->rb_left;
 		else
 			link = &(*link)->rb_right;
@@ -177,7 +177,7 @@ static int save_entry_time_stamp(unsigned int key, u64 entry_time_stamp)
 static u64 get_entry_time_stamp(unsigned int key)
 {
 	struct entry_stamp_hash_entry *current_entry;
-	struct hlist_node *node, *tmp_node;
+	struct hlist_node *tmp_node;
 	u64 entry_time_stamp = 0;
 	printk(KERN_INFO "inside get entry time \n");
 	hash_for_each_possible_safe(entry_stamp_hash_table, current_entry, tmp_node, node, key)
@@ -263,7 +263,8 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 		}
 		else
 		{
-			stack_log_length = stack_trace_save_user(&(*stack_trace_log), MAX_TRACE_SIZE);
+			spin_unlock_irqrestore(&trace_hash_table_lock, flags);
+			return 0;
 		}
 		stack_trace_hash_key = jhash2((u32 *)stack_trace_log, stack_log_length * 2, 0);
 		if (time_flag)
@@ -293,6 +294,11 @@ int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
 	if (curr_task != NULL)
 	{
+		if (curr_task->mm != NULL)
+		{
+			spin_unlock_irqrestore(&trace_hash_table_lock, flags);
+			return 0;
+		}
 		pid = (unsigned int)curr_task->pid;
 		err = save_entry_time_stamp(pid, rdtsc());
 		if (err)
