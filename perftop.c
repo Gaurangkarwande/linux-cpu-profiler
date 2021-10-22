@@ -25,7 +25,6 @@ MODULE_DESCRIPTION("LKP Project 3");
 #define MAX_TRACE_SIZE 51
 #define NUM_TASKS 20
 
-
 extern unsigned int stack_trace_save_user(unsigned long *store, unsigned int size);
 #define stack_trace_save_user (*(typeof(&stack_trace_save_user))kallsyms_stack_trace_save_user)
 void *kallsyms_stack_trace_save_user = NULL;
@@ -44,6 +43,8 @@ static char probed_function_name[FUNCTION_NAME_LENGTH] = "pick_next_task_fair";
 static DEFINE_HASHTABLE(trace_hash_table, TBL_SIZE);
 static struct rb_root trace_rbtree = RB_ROOT;
 static DEFINE_SPINLOCK(trace_hash_table_lock);
+
+static DEFINE_HASHTABLE(entry_stamp_hash_table, TBL_SIZE);
 
 struct trace_hash_entry
 { //trace_hash_table node
@@ -64,6 +65,12 @@ struct trace_rbtree_entry
 	unsigned int stack_log_length;
 	u64 task_duration;
 	struct rb_node node;
+};
+
+struct entry_stamp_hash_entry
+{
+	u64 entry_time_stamp;
+	struct hlist_node node;
 };
 
 static bool delete_prev_rbtree_entry(unsigned int key, u64 *task_duration, unsigned int *freq)
@@ -129,21 +136,60 @@ static void trace_rbtree_print_value(struct seq_file *m, int max_count)
 	struct trace_rbtree_entry *current_entry;
 	for (node = rb_first(&trace_rbtree); node && i <= max_count; node = rb_next(node))
 	{
-		seq_printf(m, "Node : %d \n", i);
+		seq_printf(m, "Rank : %d \n", i);
 		current_entry = rb_entry(node, struct trace_rbtree_entry, node);
-		seq_printf(m, "PID : %u \t Frequency : %u \t CPU Cycles: %lld  \n", current_entry->pid, current_entry->freq, current_entry->task_duration);
+		seq_printf(m, "PID : %u \t Frequency : %u \t CPU Cycles: %lld \t Jenkins Hash: %u  \n", current_entry->pid, current_entry->freq, current_entry->task_duration, current_entry->key);
 		seq_printf(m, "Stack Trace : \n");
 		if (current_entry->stack_log_length == 0)
 		{
 			seq_printf(m, "No Stack Trace.\n");
 		}
-		for (j = 0; j < current_entry->stack_log_length; j++)
+		for (j = 0; j < 4; j++)
 		{
-			seq_printf(m, "%p\n", (void *)current_entry->stack_log[j]);
+			seq_printf(m, "%pS\n", (void *)current_entry->stack_log[j]);
 		}
 		i++;
 		seq_printf(m, "\n");
 	}
+}
+
+static int save_entry_time_stamp(unsigned int key, u64 entry_time_stamp)
+{
+	struct entry_stamp_hash_entry *new_entry;
+	hash_for_each_possible(entry_stamp_hash_table, new_entry, node, key)
+	{
+		if (new_entry != NULL)
+		{
+			new_entry->entry_time_stamp = entry_time_stamp;
+			return 0;
+		}
+	}
+	if ((new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC)) == NULL)
+	{
+		printk(KERN_INFO "No memory to add new entry stamp hash table entry \n");
+		return -ENOMEM;
+	}
+	new_entry->entry_time_stamp = entry_time_stamp;
+	hash_add(entry_stamp_hash_table, &new_entry->node, key);
+	return 0;
+}
+
+static u64 get_entry_time_stamp(unsigned int key)
+{
+	struct entry_stamp_hash_entry *current_entry;
+	struct hlist_node *node, *tmp_node;
+	u64 entry_time_stamp = 0;
+	printk(KERN_INFO "inside get entry time \n");
+	hash_for_each_possible_safe(entry_stamp_hash_table, current_entry, tmp_node, node, key)
+	{
+		if (current_entry != NULL)
+		{
+			entry_time_stamp = current_entry->entry_time_stamp;
+			hash_del(&current_entry->node);
+			kfree(current_entry);
+		}
+	}
+	return entry_time_stamp;
 }
 
 static int trace_hash_store_value(unsigned int key, unsigned int pid, unsigned long *stack_log, unsigned int stack_lenght, u64 task_duration)
@@ -196,21 +242,7 @@ static void trace_hash_print_table(struct seq_file *m)
 	seq_printf(m, "\n");
 }
 
-/*
-static void destroy_hash_table_and_free(void)
-{
-
-	struct trace_hash_entry *current_entry;
-       	struct hlist_node *tmp_node;
-	int bkt;
-	printk(KERN_INFO "Destroying Hash Table : ");
-	hash_for_each_safe( trace_hash_table, bkt, tmp_node, current_entry, node) {
-		printk(KERN_CONT " %d ", current_entry->pid);
-		hash_del(&current_entry->node);
-		kfree(current_entry);
-	}
-}
-*/
+static bool time_flag = false;
 
 static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -218,30 +250,31 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	unsigned long flags;
 	unsigned int pid, stack_log_length;
 	u32 stack_trace_hash_key;
-	u64 task_duration;
+	u64 task_duration = 0;
 	unsigned long current_task_struct_pointer = regs->si;
 	struct task_struct *curr_task = (struct task_struct *)current_task_struct_pointer;
-	u64* entry_time = (u64*) ri->data;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
-	task_duration = rdtsc() - *entry_time;
 	if (curr_task != NULL)
 	{
 		pid = (unsigned int)curr_task->pid;
 		if (curr_task->mm == NULL)
 		{
-			stack_log_length = stack_trace_save(&(*stack_trace_log), MAX_TRACE_SIZE, 6); //stack_trace_log[0] vs stack_trace_log vs *stack_trace_log. why 6
+			stack_log_length = stack_trace_save(&(*stack_trace_log), MAX_TRACE_SIZE, 6);
 		}
 		else
 		{
 			stack_log_length = stack_trace_save_user(&(*stack_trace_log), MAX_TRACE_SIZE);
 		}
 		stack_trace_hash_key = jhash2((u32 *)stack_trace_log, stack_log_length * 2, 0);
-
+		if (time_flag)
+		{
+			task_duration = rdtsc() - get_entry_time_stamp(pid);
+		}
 		err = trace_hash_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
 		err = trace_rbtree_store_value(stack_trace_hash_key, pid, stack_trace_log, stack_log_length, task_duration);
 		if (err)
 		{
-			printk(KERN_INFO "Error in ret_handler \n");
+			printk(KERN_INFO "Error in entry_handler \n");
 			return err;
 		}
 	}
@@ -252,9 +285,23 @@ static int entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	unsigned long flags;
-	u64* entry_time = (u64*)ri->data;
+
+	int err;
+	unsigned int pid;
+	unsigned long current_task_struct_pointer = regs->ax;
+	struct task_struct *curr_task = (struct task_struct *)current_task_struct_pointer;
 	spin_lock_irqsave(&trace_hash_table_lock, flags);
-	*entry_time = rdtsc();
+	if (curr_task != NULL)
+	{
+		pid = (unsigned int)curr_task->pid;
+		err = save_entry_time_stamp(pid, rdtsc());
+		if (err)
+		{
+			printk(KERN_INFO "Error in ret_handler \n");
+			return err;
+		}
+		time_flag = true;
+	}
 	spin_unlock_irqrestore(&trace_hash_table_lock, flags);
 	return 0;
 }
